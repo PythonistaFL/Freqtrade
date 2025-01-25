@@ -500,30 +500,56 @@ class RPC:
 
         durations = {"wins": wins_dur, "draws": draws_dur, "losses": losses_dur}
         return {"exit_reasons": exit_reasons, "durations": durations}
-
-    def _rpc_trade_statistics(
-        self, stake_currency: str, fiat_display_currency: str, start_date: datetime | None = None
-    ) -> dict[str, Any]:
-        """Returns cumulative profit statistics"""
-
-        start_date = datetime.fromtimestamp(0) if start_date is None else start_date
-
-        trade_filter = (
-            Trade.is_open.is_(False) & (Trade.close_date >= start_date)
-        ) | Trade.is_open.is_(True)
-        trades: Sequence[Trade] = Trade.session.scalars(
-            Trade.get_trades_query(trade_filter, include_orders=False).order_by(Trade.id)
-        ).all()
-
-        profit_all_coin = []
-        profit_all_ratio = []
-        profit_closed_coin = []
-        profit_closed_ratio = []
-        durations = []
-        winning_trades = 0
-        losing_trades = 0
-        winning_profit = 0.0
-        losing_profit = 0.0
+    
+    def _process_closed_trade(self, trade, processed_result) -> tuple:
+        profit_ratio = trade.close_profit or 0.0
+        profit_abs= trade.close_profit_abs or 0.0
+        processed_result["profit_closed_coin"].append(profit_abs)
+        processed_result["profit_closed_ratio"].append(profit_ratio)
+        if profit_ratio >= 0:
+            processed_result["winning_trades"] += 1
+            processed_result["winning_profit"] += profit_abs
+        else:
+            processed_result["losing_trades"] += 1
+            processed_result["losing_profit"] += profit_abs
+        return profit_abs, profit_ratio
+    
+    def _process_opened_trade(self, trade, processed_result) -> tuple:
+        # Get current rate
+        if len(trade.select_filled_orders(trade.entry_side)) == 0:
+            # Skip trades with no filled orders
+            continue
+        try:
+            current_rate = self._freqtrade.exchange.get_rate(
+                trade.pair, side="exit", is_short=trade.is_short, refresh=False
+            )
+        except (PricingError, ExchangeError):
+            current_rate = nan
+            profit_ratio = nan
+            profit_abs = nan
+        else:
+            _profit = trade.calculate_profit(trade.close_rate or current_rate)
+            profit_ratio = _profit.profit_ratio
+            profit_abs = _profit.total_profit
+        return profit_abs, profit_ratio
+    
+    def _process_trade(self, trade, processed_result) -> tuple:
+        if not trade.is_open:
+            return _process_closed_trade(trade, processed_result)
+        _process_opened_trade(trade, processed_result)
+    
+    def _process_trades(self, trades) -> dict[str, Any]:
+        processed_result = {
+            "profit_all_coin": [],
+            "profit_all_ratio": [],
+            "profit_closed_coin": [],
+            "profit_closed_ratio": [],
+            "durations": [],
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "winning_profit": 0.0,
+            "losing_profit": 0.0
+        }
 
         for trade in trades:
             current_rate: float = 0.0
@@ -531,72 +557,12 @@ class RPC:
             if trade.close_date:
                 durations.append((trade.close_date - trade.open_date).total_seconds())
 
-            if not trade.is_open:
-                profit_ratio = trade.close_profit or 0.0
-                profit_abs = trade.close_profit_abs or 0.0
-                profit_closed_coin.append(profit_abs)
-                profit_closed_ratio.append(profit_ratio)
-                if profit_ratio >= 0:
-                    winning_trades += 1
-                    winning_profit += profit_abs
-                else:
-                    losing_trades += 1
-                    losing_profit += profit_abs
-            else:
-                # Get current rate
-                if len(trade.select_filled_orders(trade.entry_side)) == 0:
-                    # Skip trades with no filled orders
-                    continue
-                try:
-                    current_rate = self._freqtrade.exchange.get_rate(
-                        trade.pair, side="exit", is_short=trade.is_short, refresh=False
-                    )
-                except (PricingError, ExchangeError):
-                    current_rate = nan
-                    profit_ratio = nan
-                    profit_abs = nan
-                else:
-                    _profit = trade.calculate_profit(trade.close_rate or current_rate)
-
-                    profit_ratio = _profit.profit_ratio
-                    profit_abs = _profit.total_profit
+            profit_abs, profit_ratio = _process_trade(trade, processed_result)
 
             profit_all_coin.append(profit_abs)
             profit_all_ratio.append(profit_ratio)
 
-        closed_trade_count = len([t for t in trades if not t.is_open])
-
-        best_pair = Trade.get_best_pair(start_date)
-        trading_volume = Trade.get_trading_volume(start_date)
-
-        # Prepare data to display
-        profit_closed_coin_sum = round(sum(profit_closed_coin), 8)
-        profit_closed_ratio_mean = float(mean(profit_closed_ratio) if profit_closed_ratio else 0.0)
-        profit_closed_ratio_sum = sum(profit_closed_ratio) if profit_closed_ratio else 0.0
-
-        profit_closed_fiat = (
-            self._fiat_converter.convert_amount(
-                profit_closed_coin_sum, stake_currency, fiat_display_currency
-            )
-            if self._fiat_converter
-            else 0
-        )
-
-        profit_all_coin_sum = round(sum(profit_all_coin), 8)
-        profit_all_ratio_mean = float(mean(profit_all_ratio) if profit_all_ratio else 0.0)
-        # Doing the sum is not right - overall profit needs to be based on initial capital
-        profit_all_ratio_sum = sum(profit_all_ratio) if profit_all_ratio else 0.0
-        starting_balance = self._freqtrade.wallets.get_starting_balance()
-        profit_closed_ratio_fromstart = 0.0
-        profit_all_ratio_fromstart = 0.0
-        if starting_balance:
-            profit_closed_ratio_fromstart = profit_closed_coin_sum / starting_balance
-            profit_all_ratio_fromstart = profit_all_coin_sum / starting_balance
-
-        profit_factor = winning_profit / abs(losing_profit) if losing_profit else float("inf")
-
-        winrate = (winning_trades / closed_trade_count) if closed_trade_count > 0 else 0
-
+    def _update_dataframe_statistics(self, statistics, trades) -> None:
         trades_df = DataFrame(
             [
                 {
@@ -608,8 +574,6 @@ class RPC:
                 if not trade.is_open and trade.close_date
             ]
         )
-
-        expectancy, expectancy_ratio = calculate_expectancy(trades_df)
 
         drawdown = DrawDownResult()
         if len(trades_df) > 0:
@@ -623,20 +587,52 @@ class RPC:
             except ValueError:
                 # ValueError if no losing trade.
                 pass
+        
+        expectancy, expectancy_ratio = calculate_expectancy(trades_df)
 
-        profit_all_fiat = (
+        statistics.update({
+            "expectancy": expectancy,
+            "expectancy_ratio": expectancy_ratio,
+            "max_drawdown": drawdown.relative_account_drawdown,
+            "max_drawdown_abs": drawdown.drawdown_abs,
+            "max_drawdown_start": format_date(drawdown.high_date),
+            "max_drawdown_start_timestamp": dt_ts_def(drawdown.high_date),
+            "max_drawdown_end": format_date(drawdown.low_date),
+            "max_drawdown_end_timestamp": dt_ts_def(drawdown.low_date),
+            "drawdown_high": drawdown.high_value,
+            "drawdown_low": drawdown.low_value,
+        })
+
+    def _update_profit_statistics(self, statistics, processed_result) -> None:
+        profit_all_coin = processed_result["profit_all_coin"]
+        profit_all_ratio = processed_result["profit_all_ratio"]
+        profit_all_coin_sum = round(sum(profit_all_coin), 8)
+        profit_all_ratio_mean = float(mean(profit_all_ratio) if profit_all_ratio else 0.0)
+        # Doing the sum is not right - overall profit needs to be based on initial capital
+        profit_all_ratio_sum = sum(profit_all_ratio) if profit_all_ratio else 0.0
+
+        profit_closed_coin = processed_result["profit_closed_coin"]
+        profit_closed_ratio = processed_result["profit_closed_ratio"]
+        profit_closed_coin_sum = round(sum(profit_closed_coin), 8)
+        profit_closed_ratio_mean = float(mean(profit_closed_ratio) if profit_closed_ratio else 0.0)
+        profit_closed_ratio_sum = sum(profit_closed_ratio) if profit_closed_ratio else 0.0
+
+        starting_balance = self._freqtrade.wallets.get_starting_balance()
+        profit_closed_ratio_fromstart = 0.0
+        profit_all_ratio_fromstart = 0.0
+        if starting_balance:
+            profit_closed_ratio_fromstart = profit_closed_coin_sum / starting_balance
+            profit_all_ratio_fromstart = profit_all_coin_sum / starting_balance
+
+        profit_closed_fiat = (
             self._fiat_converter.convert_amount(
-                profit_all_coin_sum, stake_currency, fiat_display_currency
+                profit_closed_coin_sum, stake_currency, fiat_display_currency
             )
             if self._fiat_converter
             else 0
         )
 
-        first_date = trades[0].open_date_utc if trades else None
-        last_date = trades[-1].open_date_utc if trades else None
-        num = float(len(durations) or 1)
-        bot_start = KeyValueStore.get_datetime_value(KeyStoreKeys.BOT_START_TIME)
-        return {
+        statistics.update({
             "profit_closed_coin": profit_closed_coin_sum,
             "profit_closed_percent_mean": round(profit_closed_ratio_mean * 100, 2),
             "profit_closed_ratio_mean": profit_closed_ratio_mean,
@@ -652,37 +648,80 @@ class RPC:
             "profit_all_ratio_sum": profit_all_ratio_sum,
             "profit_all_ratio": profit_all_ratio_fromstart,
             "profit_all_percent": round(profit_all_ratio_fromstart * 100, 2),
-            "profit_all_fiat": profit_all_fiat,
-            "trade_count": len(trades),
-            "closed_trade_count": closed_trade_count,
+            "profit_all_fiat": profit_all_fiat
+        })
+    
+    def _update_statistics_dates(self, statistics, trades) -> None:
+        first_date = trades[0].open_date_utc if trades else None
+        last_date = trades[-1].open_date_utc if trades else None
+        statistics.update({
             "first_trade_date": format_date(first_date),
             "first_trade_humanized": dt_humanize_delta(first_date) if first_date else "",
             "first_trade_timestamp": dt_ts_def(first_date, 0),
             "latest_trade_date": format_date(last_date),
             "latest_trade_humanized": dt_humanize_delta(last_date) if last_date else "",
             "latest_trade_timestamp": dt_ts_def(last_date, 0),
-            "avg_duration": str(timedelta(seconds=sum(durations) / num)).split(".")[0],
-            "best_pair": best_pair[0] if best_pair else "",
-            "best_rate": round(best_pair[1] * 100, 2) if best_pair else 0,  # Deprecated
-            "best_pair_profit_ratio": best_pair[1] if best_pair else 0,
+        })
+    
+    def _update_statistics(self, statistics, processed_result, trades) -> None:
+        _update_statistics_dates(statistics, trades)
+        _update_profit_statistics(statistics, processed_result)
+        _update_dataframe_statistics(statistics, trades)
+
+    def _rpc_trade_statistics(
+        self, stake_currency: str, fiat_display_currency: str, start_date: datetime | None = None
+    ) -> dict[str, Any]:
+        """Returns cumulative profit statistics"""
+
+        start_date = datetime.fromtimestamp(0) if start_date is None else start_date
+
+        trade_filter = (
+            Trade.is_open.is_(False) & (Trade.close_date >= start_date)
+        ) | Trade.is_open.is_(True)
+        trades: Sequence[Trade] = Trade.session.scalars(
+            Trade.get_trades_query(trade_filter, include_orders=False).order_by(Trade.id)
+        ).all()
+
+        processed_result = _process_trades(trades)
+
+        durations = processed_result["durations"]
+
+        winning_trades = processed_result["winning_trades"]
+        losing_trades = processed_result["losing_trades"]
+
+        winning_profit = processed_result["winning_profit"]
+        losing_profit = processed_result["losing_profit"]
+
+        closed_trade_count = len([t for t in trades if not t.is_open])
+
+        best_pair = Trade.get_best_pair(start_date)
+        trading_volume = Trade.get_trading_volume(start_date)
+
+        profit_factor = winning_profit / abs(losing_profit) if losing_profit else float("inf")
+
+        winrate = (winning_trades / closed_trade_count) if closed_trade_count > 0 else 0
+
+        num = float(len(durations) or 1)
+        bot_start = KeyValueStore.get_datetime_value(KeyStoreKeys.BOT_START_TIME)
+        statistics = {
+            "trade_count": len(trades),
             "winning_trades": winning_trades,
             "losing_trades": losing_trades,
             "profit_factor": profit_factor,
             "winrate": winrate,
-            "expectancy": expectancy,
-            "expectancy_ratio": expectancy_ratio,
-            "max_drawdown": drawdown.relative_account_drawdown,
-            "max_drawdown_abs": drawdown.drawdown_abs,
-            "max_drawdown_start": format_date(drawdown.high_date),
-            "max_drawdown_start_timestamp": dt_ts_def(drawdown.high_date),
-            "max_drawdown_end": format_date(drawdown.low_date),
-            "max_drawdown_end_timestamp": dt_ts_def(drawdown.low_date),
-            "drawdown_high": drawdown.high_value,
-            "drawdown_low": drawdown.low_value,
-            "trading_volume": trading_volume,
             "bot_start_timestamp": dt_ts_def(bot_start, 0),
             "bot_start_date": format_date(bot_start),
+            "closed_trade_count": closed_trade_count,
+            "avg_duration": str(timedelta(seconds=sum(durations) / num)).split(".")[0],
+            "best_pair": best_pair[0] if best_pair else "",
+            "best_rate": round(best_pair[1] * 100, 2) if best_pair else 0,  # Deprecated
+            "best_pair_profit_ratio": best_pair[1] if best_pair else 0,
+            "trading_volume": trading_volume,
         }
+
+        _update_statistics(statistics, processed_result, trades)
+
+        return statistics
 
     def __balance_get_est_stake(
         self, coin: str, stake_currency: str, amount: float, balance: Wallet
