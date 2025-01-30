@@ -1309,6 +1309,9 @@ class RPC:
         last_analyzed: datetime,
         selected_cols: list[str] | None,
     ) -> dict[str, Any]:
+        """
+        Returns the current dataframe as a dict
+        """
         has_content = len(dataframe) != 0
         dataframe_columns = list(dataframe.columns)
         signals = {
@@ -1325,6 +1328,7 @@ class RPC:
                 dataframe = dataframe.loc[:, df_cols]
 
             dataframe.loc[:, "__date_ts"] = dataframe.loc[:, "date"].astype(int64) // 1000 // 1000
+
             # Move signal close to separate column when signal for easy plotting
             for sig_type in signals.keys():
                 if sig_type in dataframe.columns:
@@ -1342,6 +1346,10 @@ class RPC:
 
             dataframe = dataframe.replace({inf: None, -inf: None, nan: None})
 
+            # Convert numpy values to Python native types
+            values = dataframe.values.tolist()
+            values = [[int(x) if isinstance(x, int64) else x for x in row] for row in values]
+
         res = {
             "pair": pair,
             "timeframe": timeframe,
@@ -1349,7 +1357,7 @@ class RPC:
             "strategy": strategy,
             "all_columns": dataframe_columns,
             "columns": list(dataframe.columns),
-            "data": dataframe.values.tolist(),
+            "data": values if has_content else [],
             "length": len(dataframe),
             "buy_signals": signals["enter_long"],  # Deprecated
             "sell_signals": signals["exit_long"],  # Deprecated
